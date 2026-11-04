@@ -1,0 +1,108 @@
+name: 與上游同步
+
+# 每日台北時間約 03:00（UTC 19:00；GitHub 排程可能稍晚）把本 fork 的預設分支
+# 與上游（parent）預設分支合併。也可在 Actions 頁面手動執行。
+#
+# 呼叫的是 merge-upstream API，也就是 `gh repo sync` 在未加 --force 時使用的端點：
+# 能快轉就快轉，否則建立 merge commit，本 fork 自己的提交與新增檔案都留著。
+# 絕不使用 `gh repo sync --force`，也不做 git push --force。
+# 合併衝突時 API 回 HTTP 409，本工作流程失敗並嘗試開（或更新）issue，不會覆蓋任一邊。
+
+on:
+  schedule:
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 合併上游預設分支
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 與上游合併（衝突則開 issue，不覆蓋）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          meta=$(gh api "repos/${GITHUB_REPOSITORY}")
+          is_fork=$(echo "$meta" | jq -r '.fork')
+          parent=$(echo "$meta" | jq -r '.parent.full_name // empty')
+          parent_branch=$(echo "$meta" | jq -r '.parent.default_branch // empty')
+          branch=$(echo "$meta" | jq -r '.default_branch')
+          has_issues=$(echo "$meta" | jq -r '.has_issues')
+
+          if [ "$is_fork" != "true" ] || [ -z "$parent" ]; then
+            echo "::error::此儲存庫不是 fork，或讀不到上游 parent，已停止。沒有改寫任何分支。"
+            exit 1
+          fi
+
+          echo "上游：${parent}（預設分支 ${parent_branch:-unknown}）"
+          echo "本 fork 預設分支：${branch}"
+
+          # 成功：fast-forward、merge，或已是最新（merge_type=none）。
+          # 409：有衝突。其他錯誤一樣失敗，但不覆蓋。
+          set +e
+          raw=$(gh api --method POST -i \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f "branch=${branch}" 2>&1)
+          code=$?
+          set -e
+
+          printf '%s\n' "$raw"
+
+          if [ "$code" -eq 0 ]; then
+            echo "同步完成。本 fork 自己的提交與新增檔案都保留。"
+            exit 0
+          fi
+
+          echo "::error::與上游 ${parent} 合併失敗。沒有 force-push，本 fork 的檔案都還在。"
+
+          if printf '%s\n' "$raw" | grep -Eq 'HTTP/[0-9.]+ 409|HTTP 409'; then
+            run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            title="上游同步發生合併衝突"
+            report="${RUNNER_TEMP}/upstream-sync-conflict.md"
+
+            if [ "$has_issues" != "true" ]; then
+              echo "::warning::此儲存庫未啟用 Issues，無法開 issue。請到 Settings → General → Features 勾選 Issues。同步仍然失敗，沒有覆蓋任何檔案。"
+            else
+              existing=$(gh issue list --state open --limit 100 --json number,title \
+                --jq '[.[] | select(.title == "上游同步發生合併衝突") | .number] | first // empty')
+
+              if [ -n "$existing" ]; then
+                printf '%s\n' \
+                  "再次於 $(date -u +%Y-%m-%dT%H:%M:%SZ) 同步失敗。工作流程已停止，沒有 force-push，也沒有覆蓋本 fork 的提交或檔案。" \
+                  "" \
+                  "- 上游：\`${parent}\`" \
+                  "- 本 fork 分支：\`${branch}\`" \
+                  "- 執行紀錄：${run_url}" \
+                  > "$report"
+                gh issue comment "$existing" --body-file "$report"
+                echo "已在既有 issue #${existing} 留言。"
+              else
+                printf '%s\n' \
+                  "每日上游同步無法自動合併，工作流程已停止，**沒有** force-push，也沒有覆蓋本 fork 既有的提交或檔案。" \
+                  "" \
+                  "- 上游：\`${parent}\`" \
+                  "- 本 fork 分支：\`${branch}\`" \
+                  "- 失敗的執行：${run_url}" \
+                  "" \
+                  "請在本機把上游合併進來、解決衝突後再 push。這則 issue 可在衝突排除後關閉；若之後再次衝突，會在同一則 issue 留言，不會重複開新的。" \
+                  > "$report"
+                gh issue create --title "$title" --body-file "$report"
+                echo "已開立衝突 issue。"
+              fi
+            fi
+          fi
+
+          exit 1
